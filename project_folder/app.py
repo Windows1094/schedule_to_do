@@ -3,76 +3,235 @@ from openai import OpenAI
 import base64
 import json
 import pandas as pd
+from datetime import datetime, timedelta, time
 
 st.set_page_config(layout="wide")
 
 if "api_key" not in st.session_state:
     st.session_state.api_key = ""
+if "parsed_json" not in st.session_state:
+    st.session_state.parsed_json = None
+if "final_schedule" not in st.session_state:
+    st.session_state.final_schedule = None
 
 def encode_image(image_file):
     return base64.b64encode(image_file.getvalue()).decode('utf-8')
 
+def calculate_free_time(parsed_json, daily_settings):
+    days = ["월", "화", "수", "목", "금"]
+    free_times = []
+    df = pd.DataFrame(parsed_json)
+    buffer = timedelta(minutes=10)
+    
+    for day in days:
+        start_str = daily_settings[day]['start']
+        end_str = daily_settings[day]['end']
+        day_start = datetime.strptime(start_str, "%H:%M")
+        day_end = datetime.strptime(end_str, "%H:%M")
+        
+        if day not in df['요일'].values:
+            duration = int((day_end - day_start).total_seconds() / 60)
+            if duration > 0:
+                free_times.append({
+                    "요일": day, 
+                    "시작": day_start.strftime("%H:%M"), 
+                    "종료": day_end.strftime("%H:%M"), 
+                    "소요시간(분)": duration
+                })
+            continue
+            
+        day_classes = df[df['요일'] == day].sort_values(by='시작')
+        current_time = day_start
+        
+        for _, row in day_classes.iterrows():
+            class_start = datetime.strptime(row['시작'], "%H:%M")
+            class_end = datetime.strptime(row['종료'], "%H:%M")
+            
+            buffered_start = class_start - buffer
+            buffered_end = class_end + buffer
+            
+            if current_time < buffered_start:
+                duration = int((buffered_start - current_time).total_seconds() / 60)
+                if duration > 0:
+                    free_times.append({
+                        "요일": day,
+                        "시작": current_time.strftime("%H:%M"),
+                        "종료": buffered_start.strftime("%H:%M"),
+                        "소요시간(분)": duration
+                    })
+            
+            current_time = max(current_time, buffered_end)
+        
+        if current_time < day_end:
+            duration = int((day_end - current_time).total_seconds() / 60)
+            if duration > 0:
+                free_times.append({
+                    "요일": day,
+                    "시작": current_time.strftime("%H:%M"),
+                    "종료": day_end.strftime("%H:%M"),
+                    "소요시간(분)": duration
+                })
+                
+    return free_times
+
 st.title("공강 스케줄러")
 
-api_key_input = st.text_input("OpenAI API Key를 입력하세요", type="password", value=st.session_state.api_key)
+api_key_input = st.text_input("OpenAI API Key", type="password", value=st.session_state.api_key)
 
 if api_key_input:
     st.session_state.api_key = api_key_input
     client = OpenAI(api_key=st.session_state.api_key)
     
-    uploaded_file = st.file_uploader("에브리타임 시간표 이미지 업로드", type=["png", "jpg", "jpeg"])
+    uploaded_file = st.file_uploader("시간표 이미지 업로드", type=["png", "jpg", "jpeg"])
 
     if uploaded_file is not None:
-        col1, col2 = st.columns(2)
+        st.image(uploaded_file, width=500)
         
-        with col1:
-            st.image(uploaded_file, use_container_width=True)
+        if st.button("분석하기"):
+            with st.spinner("분석 중..."):
+                base64_image = encode_image(uploaded_file)
+                
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You must output strictly in JSON format without any markdown wrappers. The format should be a list of dictionaries, like: [{\"요일\": \"월\", \"과목명\": \"수학\", \"시작\": \"09:00\", \"종료\": \"10:30\"}]"
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text", 
+                                        "text": "이 시간표 이미지에서 월요일부터 금요일까지의 수업 요일, 과목명, 시작 시간, 종료 시간을 JSON 형식으로 추출해."
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{base64_image}"
+                                        }
+                                    }
+                                ]
+                            }
+                        ],
+                        max_completion_tokens=1500
+                    )
+                    
+                    raw_text = response.choices[0].message.content
+                    cleaned_text = raw_text.replace("```json", "").replace("```", "").strip()
+                    st.session_state.parsed_json = json.loads(cleaned_text)
+                    st.session_state.final_schedule = None
+                    
+                except Exception as e:
+                    st.error(f"오류: {e}")
+
+    if st.session_state.parsed_json:
+        st.divider()
+        st.subheader("요일별 일과 및 점심시간 설정")
         
-        with col2:
-            if st.button("시간표 분석하기"):
-                with st.spinner("AI가 시간표를 읽고 있습니다..."):
-                    base64_image = encode_image(uploaded_file)
+        days = ['월', '화', '수', '목', '금']
+        cols = st.columns(5)
+        daily_settings = {}
+        
+        for i, day in enumerate(days):
+            with cols[i]:
+                st.markdown(f"**{day}요일**")
+                s_time = st.time_input("일과 시작", value=time(9, 0), key=f"start_{day}")
+                e_time = st.time_input("일과 종료", value=time(18, 0), key=f"end_{day}")
+                st.markdown("---")
+                l_start = st.time_input("점심 시작", value=time(12, 0), key=f"l_start_{day}")
+                l_end = st.time_input("점심 종료", value=time(13, 0), key=f"l_end_{day}")
+                
+                daily_settings[day] = {
+                    "start": s_time.strftime("%H:%M"),
+                    "end": e_time.strftime("%H:%M"),
+                    "lunch_start": l_start.strftime("%H:%M"),
+                    "lunch_end": l_end.strftime("%H:%M")
+                }
+                
+        df_classes = pd.DataFrame(st.session_state.parsed_json)
+        free_times = calculate_free_time(st.session_state.parsed_json, daily_settings)
+        
+        st.divider()
+        st.subheader("공강 시간 활동 AI 큐레이션")
+        
+        preset_activities = [
+            "전공 과제/복습", 
+            "교양 과제", 
+            "도서관에서 독서", 
+            "학생회관/동아리방 방문", 
+            "교내 카페에서 휴식", 
+            "낮잠 자기", 
+            "헬스장/가벼운 운동", 
+            "밀린 인강 듣기"
+        ]
+        
+        selected_activities = st.multiselect("공강 시간에 하고 싶은 활동들을 선택하세요", preset_activities)
+        custom_activity = st.text_input("원하는 활동 직접 입력 (쉼표로 구분하여 여러 개 입력 가능)")
+        
+        if st.button("AI 스케줄 자동 배정하기"):
+            if not free_times:
+                st.warning("배정할 공강 시간이 없습니다.")
+            else:
+                with st.spinner("AI가 최적의 일정을 구성하고 있습니다..."):
+                    all_activities = selected_activities.copy()
+                    if custom_activity.strip():
+                        all_activities.extend([act.strip() for act in custom_activity.split(",")])
+                        
+                    lunch_info = {day: f"{daily_settings[day]['lunch_start']}~{daily_settings[day]['lunch_end']}" for day in days}
+                    
+                    system_prompt = """
+                    You are an AI that schedules student activities into free time slots. 
+                    You must output strictly in JSON format without any markdown wrappers. 
+                    The format must be a list of dictionaries: [{"요일": "월", "시간": "12:10~13:20", "활동": "점심 식사 (학생식당)"}]
+                    """
+                    
+                    user_prompt = f"""
+                    다음은 나의 요일별 공강 시간 목록(분 단위 소요시간 포함)이야:
+                    {json.dumps(free_times, ensure_ascii=False)}
+                    
+                    나의 요일별 희망 점심시간은 다음과 같아:
+                    {json.dumps(lunch_info, ensure_ascii=False)}
+                    
+                    내가 공강 시간에 하고 싶은 활동 목록은 다음과 같아: {all_activities}
+                    
+                    조건:
+                    1. 요일별 희망 점심시간(또는 그와 가장 가까운 공강 시간)에는 '점심 식사'를 반드시 배정해.
+                    2. 남은 공강 시간의 길이를 고려해서 내가 선택한 활동들을 적절히 분배해서 채워 넣어.
+                    3. 긴 공강에는 공부나 과제를, 짧은 공강에는 휴식이나 독서를 배정하는 등 상식적으로 구성해.
+                    """
                     
                     try:
-                        response = client.chat.completions.create(
-                            model="gpt-5.4-mini",
+                        res = client.chat.completions.create(
+                            model="gpt-4o-mini",
                             messages=[
-                                {
-                                    "role": "system",
-                                    "content": "You must output strictly in JSON format without any markdown wrappers. The format should be a list of dictionaries, like: [{\"요일\": \"월\", \"과목명\": \"수학\", \"시작\": \"09:00\", \"종료\": \"10:30\"}]"
-                                },
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "text", 
-                                            "text": "이 시간표 이미지에서 월요일부터 금요일까지의 수업 요일, 과목명, 시작 시간, 종료 시간을 JSON 형식으로 추출해."
-                                        },
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {
-                                                "url": f"data:image/jpeg;base64,{base64_image}"
-                                            }
-                                        }
-                                    ]
-                                }
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
                             ],
-                            max_completion_tokens=1500
+                            max_completion_tokens=2000
                         )
                         
-                        raw_text = response.choices[0].message.content
-                        cleaned_text = raw_text.replace("```json", "").replace("```", "").strip()
-                        parsed_json = json.loads(cleaned_text)
-                        
-                        st.success("시간표 분석이 완료되었습니다")
-
-                        df = pd.DataFrame(parsed_json)
-
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                        
-                    except json.JSONDecodeError:
-                        st.error("JSON 파싱 오류: AI가 형태를 잘못 반환했습니다. 다시 시도해주세요.")
+                        raw_ans = res.choices[0].message.content
+                        clean_ans = raw_ans.replace("```json", "").replace("```", "").strip()
+                        st.session_state.final_schedule = json.loads(clean_ans)
                     except Exception as e:
-                        st.error(f"오류가 발생했습니다: {e}")
-else:
-    st.warning("앱을 사용하려면 먼저 OpenAI API Key를 입력해주세요.")
+                        st.error(f"AI 배정 오류: {e}")
+
+        if st.session_state.final_schedule:
+            st.success("AI가 맞춤형 공강 스케줄을 완성했습니다!")
+            df_final = pd.DataFrame(st.session_state.final_schedule)
+            
+            day_order = ['월', '화', '수', '목', '금']
+            df_final['요일'] = pd.Categorical(df_final['요일'], categories=day_order, ordered=True)
+            df_final = df_final.sort_values(['요일', '시간']).reset_index(drop=True)
+            
+            tabs = st.tabs([f"{day}요일" for day in days])
+            for i, day in enumerate(days):
+                with tabs[i]:
+                    day_sched = df_final[df_final['요일'] == day]
+                    if not day_sched.empty:
+                        day_sched = day_sched[['시간', '활동']]
+                        st.dataframe(day_sched, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("이 날은 배정된 공강 활동이 없습니다.")
